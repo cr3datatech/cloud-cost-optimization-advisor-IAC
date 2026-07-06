@@ -1,0 +1,25 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Cost Optimization Advisor baseline stack.
+  Replace placeholder resources with full ingestion, analysis, storage, and email workflow.
+
+Parameters:
+  CostDataBucketName:
+    Type: String
+  AnalysisBucketName:
+    Type: String
+  ReportSenderEmail:
+    Type: String
+  ReportFrequency:
+    Type: String
+    AllowedValues:
+      - daily
+      - weekly
+  EmailRecipients:
+    Type: String
+
+Resources: {}
+
+Outputs:
+  Notes:
+    Value: Placeholder template. Add resources for CUR ingestion, analytics, and SES reporting.

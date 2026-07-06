@@ -1,0 +1,14 @@
+{
+  "name": "cloud-cost-optimization-advisor-iac",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy:aws": "node scripts/deploy-aws.mjs",
+    "deploy:azure": "node scripts/deploy-azure.mjs",
+    "deploy:gcp": "node scripts/deploy-gcp.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  }
+}
