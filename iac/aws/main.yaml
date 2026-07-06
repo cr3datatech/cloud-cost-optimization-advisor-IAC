@@ -1,25 +1,435 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Cost Optimization Advisor baseline stack.
-  Replace placeholder resources with full ingestion, analysis, storage, and email workflow.
+  Cloud Cost Optimization Advisor for AWS.
+  Provisions scheduled cost collection, AI-assisted analysis, S3 storage, and SES email reporting.
 
 Parameters:
   CostDataBucketName:
     Type: String
+    Description: S3 bucket name for raw cost snapshots.
   AnalysisBucketName:
     Type: String
+    Description: S3 bucket name for analyzed reports.
   ReportSenderEmail:
     Type: String
+    Description: Email endpoint to subscribe to SNS report notifications.
   ReportFrequency:
     Type: String
+    Description: Report schedule frequency.
     AllowedValues:
       - daily
       - weekly
-  EmailRecipients:
+  OpenAIApiKey:
     Type: String
+    NoEcho: true
+    Description: OpenAI API key used to generate optimization narratives.
+  AIModel:
+    Type: String
+    Default: gpt-4.1
+    Description: OpenAI model for report generation.
 
-Resources: {}
+Conditions:
+  IsDaily: !Equals [!Ref ReportFrequency, daily]
+
+Resources:
+  CostDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref CostDataBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  AnalysisBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref AnalysisBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  AdvisorFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cost-advisor-lambda-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${CostDataBucketName}
+                  - !Sub arn:aws:s3:::${CostDataBucketName}/*
+                  - !Sub arn:aws:s3:::${AnalysisBucketName}
+                  - !Sub arn:aws:s3:::${AnalysisBucketName}/*
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: '*'
+
+  AdvisorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub cost-advisor-${AWS::StackName}
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 512
+      Role: !GetAtt AdvisorFunctionRole.Arn
+      Environment:
+        Variables:
+          COST_BUCKET: !Ref CostDataBucketName
+          ANALYSIS_BUCKET: !Ref AnalysisBucketName
+          REPORT_FREQUENCY: !Ref ReportFrequency
+          OPENAI_API_KEY: !Ref OpenAIApiKey
+          OPENAI_MODEL: !Ref AIModel
+      Code:
+        ZipFile: |
+          import boto3, json, os, urllib.request, urllib.error
+          from datetime import datetime, timedelta, timezone
+
+          ce = boto3.client("ce", region_name="us-east-1")
+          s3 = boto3.client("s3")
+
+          def _top_items(results, limit=8):
+              out = []
+              for item in results:
+                  amount = float(item["Metrics"]["UnblendedCost"]["Amount"])
+                  out.append({"service": item["Keys"][0], "cost": round(amount, 2)})
+              out.sort(key=lambda x: x["cost"], reverse=True)
+              return out[:limit]
+
+          def _build_heuristics(top_services):
+              recs = []
+              for entry in top_services[:5]:
+                  est = round(entry["cost"] * 0.1, 2)
+                  recs.append({
+                      "service": entry["service"],
+                      "observed_cost": entry["cost"],
+                      "suggested_action": "Review rightsizing, idle resources, and commitment discounts.",
+                      "estimated_monthly_saving": est,
+                  })
+              return recs
+
+          def _ai_summary(payload):
+              key = os.environ.get("OPENAI_API_KEY", "").strip()
+              if not key:
+                  return "OPENAI_API_KEY not configured. Returning deterministic recommendations only."
+
+              body = {
+                  "model": os.environ.get("OPENAI_MODEL", "gpt-4.1"),
+                  "messages": [
+                      {
+                          "role": "system",
+                          "content": "You are a FinOps expert. Return concise, practical cost optimization advice.",
+                      },
+                      {
+                          "role": "user",
+                          "content": (
+                              "Summarize the latest AWS cost findings and prioritize actions. "
+                              "Use at most 8 bullet points. Data: " + json.dumps(payload)
+                          ),
+                      },
+                  ],
+                  "temperature": 0.2,
+              }
+              req = urllib.request.Request(
+                  "https://api.openai.com/v1/chat/completions",
+                  data=json.dumps(body).encode("utf-8"),
+                  headers={
+                      "Content-Type": "application/json",
+                      "Authorization": f"Bearer {key}",
+                  },
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=25) as resp:
+                      raw = json.loads(resp.read().decode("utf-8"))
+                  return raw["choices"][0]["message"]["content"].strip()
+              except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError) as exc:
+                  return f"AI summary unavailable ({exc}). Use deterministic recommendations below."
+
+          def _text_report(window, total, top_services, recs, ai_text):
+              lines = [
+                  f"Cloud Cost Advisor Report ({window})",
+                  f"Total spend: ${total:.2f}",
+                  "",
+                  "Top services:",
+              ]
+              for item in top_services:
+                  lines.append(f"- {item['service']}: ${item['cost']:.2f}")
+              lines.extend(["", "AI summary:", ai_text, "", "Action candidates:"])
+              for r in recs:
+                  lines.append(
+                      f"- {r['service']}: {r['suggested_action']} "
+                      f"(est monthly saving ${r['estimated_monthly_saving']:.2f})"
+                  )
+              return "\n".join(lines)
+
+          def handler(event, context):
+              now = datetime.now(timezone.utc)
+              end = now.date()
+              frequency = os.environ.get("REPORT_FREQUENCY", "daily").strip().lower()
+              lookback_days = 1 if frequency == "daily" else 7
+              start = (now - timedelta(days=lookback_days)).date()
+              window = f"{start.isoformat()} to {end.isoformat()}"
+
+              cost = ce.get_cost_and_usage(
+                  TimePeriod={"Start": start.isoformat(), "End": end.isoformat()},
+                  Granularity="DAILY",
+                  Metrics=["UnblendedCost"],
+                  GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
+              )
+
+              grouped = cost.get("ResultsByTime", [])
+              latest = grouped[-1].get("Groups", []) if grouped else []
+              top_services = _top_items(latest)
+              total_spend = sum([x["cost"] for x in top_services])
+              recs = _build_heuristics(top_services)
+
+              raw_key = now.strftime("raw/%Y/%m/%d/cost-and-usage.json")
+              s3.put_object(
+                  Bucket=os.environ["COST_BUCKET"],
+                  Key=raw_key,
+                  Body=json.dumps(cost, default=str).encode("utf-8"),
+                  ContentType="application/json",
+              )
+
+              analysis_payload = {
+                  "generated_at": now.isoformat(),
+                  "window": window,
+                  "top_services": top_services,
+                  "recommendations": recs,
+              }
+              analysis_payload["ai_summary"] = _ai_summary(analysis_payload)
+
+              report_key = now.strftime("analysis/%Y/%m/%d/report.json")
+              latest_key = "analysis/latest.json"
+              body = json.dumps(analysis_payload, indent=2).encode("utf-8")
+              for key in (report_key, latest_key):
+                  s3.put_object(
+                      Bucket=os.environ["ANALYSIS_BUCKET"],
+                      Key=key,
+                      Body=body,
+                      ContentType="application/json",
+                  )
+
+              return {
+                  "status": "ok",
+                  "raw_key": raw_key,
+                  "report_key": report_key,
+                  "recipient_count": 0,
+              }
+
+  ReportTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub cost-advisor-report-${AWS::StackName}
+
+  ReportTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ReportTopic
+      Protocol: email
+      Endpoint: !Ref ReportSenderEmail
+
+  ReportMailerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cost-advisor-mailer-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub arn:aws:s3:::${AnalysisBucketName}/*
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref ReportTopic
+
+  ReportMailerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub cost-advisor-mailer-${AWS::StackName}
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt ReportMailerRole.Arn
+      Environment:
+        Variables:
+          REPORT_TOPIC_ARN: !Ref ReportTopic
+      Code:
+        ZipFile: |
+          import boto3, json, os, urllib.parse
+
+          s3 = boto3.client("s3")
+          sns = boto3.client("sns")
+
+          def handler(event, context):
+              detail = event.get("detail", {})
+              bucket = detail.get("bucket", {}).get("name")
+              obj_key = detail.get("object", {}).get("key")
+
+              if not bucket or not obj_key:
+                  return {"status": "ignored", "reason": "missing S3 detail"}
+
+              key = urllib.parse.unquote_plus(obj_key)
+              if not key.startswith("analysis/") or not key.endswith("/report.json"):
+                  return {"status": "ignored", "reason": "non-report object", "key": key}
+
+              obj = s3.get_object(Bucket=bucket, Key=key)
+              body = obj["Body"].read().decode("utf-8")
+              payload = json.loads(body)
+
+              window = payload.get("window", "unknown-window")
+              summary = payload.get("ai_summary", "No AI summary available.")
+              recommendations = payload.get("recommendations", [])
+              lines = [
+                  f"AWS Cost Advisor Report ({window})",
+                  "",
+                  "AI summary:",
+                  summary,
+                  "",
+                  "Top recommendations:",
+              ]
+              for rec in recommendations[:8]:
+                  lines.append(
+                      f"- {rec.get('service', 'unknown')}: {rec.get('suggested_action', 'review')}. "
+                      f"Estimated monthly saving ${float(rec.get('estimated_monthly_saving', 0.0)):.2f}"
+                  )
+
+              message = "\n".join(lines)
+              sns.publish(
+                  TopicArn=os.environ["REPORT_TOPIC_ARN"],
+                  Subject="AWS Cost Advisor Report",
+                  Message=message,
+              )
+
+              return {"status": "sent", "bucket": bucket, "key": key}
+
+  ReportCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub cost-advisor-report-created-${AWS::StackName}
+      Description: Triggers report mailer when a new analysis report is written to S3.
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref AnalysisBucketName
+          object:
+            key:
+              - prefix: analysis/
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ReportMailerFunction.Arn
+          Id: report-mailer-target
+
+  ReportMailerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ReportMailerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ReportCreatedRule.Arn
+
+  AdvisorScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub cost-advisor-schedule-${AWS::StackName}
+      Description: Triggers cost advisor analysis workflow.
+      ScheduleExpression: !If [IsDaily, 'cron(0 8 * * ? *)', 'cron(0 8 ? * MON *)']
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AdvisorFunction.Arn
+          Id: advisor-lambda-target
+
+  AdvisorLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdvisorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AdvisorScheduleRule.Arn
 
 Outputs:
-  Notes:
-    Value: Placeholder template. Add resources for CUR ingestion, analytics, and SES reporting.
+  CostDataBucketNameOutput:
+    Description: Raw cost data bucket.
+    Value: !Ref CostDataBucketName
+  AnalysisBucketNameOutput:
+    Description: Analysis bucket.
+    Value: !Ref AnalysisBucketName
+  AdvisorFunctionArn:
+    Description: Lambda function ARN.
+    Value: !GetAtt AdvisorFunction.Arn
+  ReportMailerFunctionArn:
+    Description: Report mailer Lambda function ARN.
+    Value: !GetAtt ReportMailerFunction.Arn
+  ReportTopicArn:
+    Description: SNS topic used for report email notifications.
+    Value: !Ref ReportTopic
+  ScheduleExpression:
+    Description: Active schedule for advisor runs.
+    Value: !If [IsDaily, 'cron(0 8 * * ? *)', 'cron(0 8 ? * MON *)']

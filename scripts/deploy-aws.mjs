@@ -6,9 +6,9 @@ requireEnv([
   "AWS_STACK_NAME",
   "AWS_COST_BUCKET",
   "AWS_ANALYSIS_BUCKET",
+  "AWS_REPORT_FREQUENCY",
   "AWS_REPORT_SENDER_EMAIL",
-  "REPORT_FREQUENCY",
-  "EMAIL_RECIPIENTS"
+  "OPENAI_API_KEY"
 ]);
 
 const profile = process.env.AWS_PROFILE;
@@ -38,8 +38,9 @@ runCommand("aws", [
   `CostDataBucketName=${process.env.AWS_COST_BUCKET}`,
   `AnalysisBucketName=${process.env.AWS_ANALYSIS_BUCKET}`,
   `ReportSenderEmail=${process.env.AWS_REPORT_SENDER_EMAIL}`,
-  `ReportFrequency=${process.env.REPORT_FREQUENCY}`,
-  `EmailRecipients=${process.env.EMAIL_RECIPIENTS}`
+  `OpenAIApiKey=${process.env.OPENAI_API_KEY}`,
+  `AIModel=${getEnv("AI_MODEL", "gpt-4.1")}`,
+  `ReportFrequency=${process.env.AWS_REPORT_FREQUENCY}`
 ]);
 
 console.log("AWS deployment complete.");
