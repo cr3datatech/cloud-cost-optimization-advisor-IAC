@@ -35,7 +35,18 @@ Resources:
   CostDataBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Ref CostDataBucketName
+      BucketName: !Sub
+        - "${BaseName}-${Suffix}"
+        - BaseName: !Ref CostDataBucketName
+          Suffix: !Select
+            - 0
+            - !Split
+              - '-'
+              - !Select
+                - 2
+                - !Split
+                  - '/'
+                  - !Ref AWS::StackId
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -51,7 +62,18 @@ Resources:
   AnalysisBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Ref AnalysisBucketName
+      BucketName: !Sub
+        - "${BaseName}-${Suffix}"
+        - BaseName: !Ref AnalysisBucketName
+          Suffix: !Select
+            - 0
+            - !Split
+              - '-'
+              - !Select
+                - 2
+                - !Split
+                  - '/'
+                  - !Ref AWS::StackId
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -98,10 +120,10 @@ Resources:
                   - s3:GetObject
                   - s3:ListBucket
                 Resource:
-                  - !Sub arn:aws:s3:::${CostDataBucketName}
-                  - !Sub arn:aws:s3:::${CostDataBucketName}/*
-                  - !Sub arn:aws:s3:::${AnalysisBucketName}
-                  - !Sub arn:aws:s3:::${AnalysisBucketName}/*
+                  - !Sub arn:aws:s3:::${CostDataBucket}
+                  - !Sub arn:aws:s3:::${CostDataBucket}/*
+                  - !Sub arn:aws:s3:::${AnalysisBucket}
+                  - !Sub arn:aws:s3:::${AnalysisBucket}/*
               - Effect: Allow
                 Action:
                   - events:PutEvents
@@ -118,26 +140,32 @@ Resources:
       Role: !GetAtt AdvisorFunctionRole.Arn
       Environment:
         Variables:
-          COST_BUCKET: !Ref CostDataBucketName
-          ANALYSIS_BUCKET: !Ref AnalysisBucketName
+          COST_BUCKET: !Ref CostDataBucket
+          ANALYSIS_BUCKET: !Ref AnalysisBucket
           REPORT_FREQUENCY: !Ref ReportFrequency
           OPENAI_API_KEY: !Ref OpenAIApiKey
           OPENAI_MODEL: !Ref AIModel
       Code:
         ZipFile: |
           import boto3, json, os, urllib.request, urllib.error
+          from collections import defaultdict
           from datetime import datetime, timedelta, timezone
 
           ce = boto3.client("ce", region_name="us-east-1")
           s3 = boto3.client("s3")
 
-          def _top_items(results, limit=8):
-              out = []
-              for item in results:
-                  amount = float(item["Metrics"]["UnblendedCost"]["Amount"])
-                  out.append({"service": item["Keys"][0], "cost": round(amount, 2)})
-              out.sort(key=lambda x: x["cost"], reverse=True)
-              return out[:limit]
+          def _aggregate_service_costs(results_by_time):
+              totals = defaultdict(float)
+              for day in results_by_time:
+                  for item in day.get("Groups", []):
+                      service = item.get("Keys", ["Unknown"])[0]
+                      amount = float(item.get("Metrics", {}).get("UnblendedCost", {}).get("Amount", 0.0))
+                      totals[service] += amount
+              return [{"service": service, "cost": round(cost, 2)} for service, cost in totals.items()]
+
+          def _top_items(items, limit=8):
+              items.sort(key=lambda x: x["cost"], reverse=True)
+              return items[:limit]
 
           def _build_heuristics(top_services):
               recs = []
@@ -210,7 +238,7 @@ Resources:
               now = datetime.now(timezone.utc)
               end = now.date()
               frequency = os.environ.get("REPORT_FREQUENCY", "daily").strip().lower()
-              lookback_days = 1 if frequency == "daily" else 7
+              lookback_days = 1 if frequency == "daily" else 30
               start = (now - timedelta(days=lookback_days)).date()
               window = f"{start.isoformat()} to {end.isoformat()}"
 
@@ -222,9 +250,9 @@ Resources:
               )
 
               grouped = cost.get("ResultsByTime", [])
-              latest = grouped[-1].get("Groups", []) if grouped else []
-              top_services = _top_items(latest)
-              total_spend = sum([x["cost"] for x in top_services])
+              service_totals = _aggregate_service_costs(grouped)
+              top_services = _top_items(service_totals)
+              total_spend = round(sum([x["cost"] for x in service_totals]), 2)
               recs = _build_heuristics(top_services)
 
               raw_key = now.strftime("raw/%Y/%m/%d/cost-and-usage.json")
@@ -298,7 +326,7 @@ Resources:
                 Action:
                   - s3:GetObject
                 Resource:
-                  - !Sub arn:aws:s3:::${AnalysisBucketName}/*
+                  - !Sub arn:aws:s3:::${AnalysisBucket}/*
               - Effect: Allow
                 Action:
                   - sns:Publish
@@ -378,7 +406,7 @@ Resources:
         detail:
           bucket:
             name:
-              - !Ref AnalysisBucketName
+              - !Ref AnalysisBucket
           object:
             key:
               - prefix: analysis/
@@ -417,10 +445,10 @@ Resources:
 Outputs:
   CostDataBucketNameOutput:
     Description: Raw cost data bucket.
-    Value: !Ref CostDataBucketName
+    Value: !Ref CostDataBucket
   AnalysisBucketNameOutput:
     Description: Analysis bucket.
-    Value: !Ref AnalysisBucketName
+    Value: !Ref AnalysisBucket
   AdvisorFunctionArn:
     Description: Lambda function ARN.
     Value: !GetAtt AdvisorFunction.Arn
